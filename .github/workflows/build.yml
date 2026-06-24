@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - "haut-auth/**"
+      - ".github/workflows/build.yml"
   workflow_dispatch:
 
 jobs:
