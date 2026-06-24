@@ -21,9 +21,10 @@ jobs:
             sdk_url: https://downloads.openwrt.org/releases/23.05.4/targets/armsr/armv8/openwrt-sdk-23.05.4-armsr-armv8_gcc-12.3.0_musl.Linux-x86_64.tar.xz
           # 编译 Snapshot 快照版以获取 .apk 文件
           - arch: x86_64_apk
-            sdk_url: https://downloads.openwrt.org/snapshots/targets/x86/64/openwrt-sdk-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.xz
+            sdk_url: https://downloads.openwrt.org/snapshots/targets/x86/64/openwrt-sdk-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
           - arch: aarch64_apk
-            sdk_url: https://downloads.openwrt.org/snapshots/targets/armsr/armv8/openwrt-sdk-armsr-armv8_gcc-13.3.0_musl.Linux-x86_64.tar.xz
+            sdk_url: https://downloads.openwrt.org/snapshots/targets/armsr/armv8/openwrt-sdk-armsr-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+          # 你可以在这里添加更多你需要的架构
 
     steps:
       - name: Checkout repository
@@ -34,14 +35,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential clang flex bison g++ gawk \
             gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
-            python3-distutils rsync unzip zlib1g-dev file wget
+            python3-distutils rsync unzip zlib1g-dev file wget zstd \
+            cmake ninja-build pkg-config curl
 
       - name: Download and Extract SDK
         run: |
-          wget -O sdk.tar.xz "${{ matrix.sdk_url }}"
+          FILENAME=$(basename "${{ matrix.sdk_url }}")
+          wget -O "$FILENAME" "${{ matrix.sdk_url }}"
           mkdir sdk
-          tar -xf sdk.tar.xz -C sdk --strip-components=1
+          tar -xf "$FILENAME" -C sdk --strip-components=1
           cd sdk
+          # 初始化 feeds
           cp feeds.conf.default feeds.conf
           echo "src-link customfeed ${{ github.workspace }}" >> feeds.conf
           ./scripts/feeds update -a
@@ -57,77 +61,70 @@ jobs:
           restore-keys: |
             openwrt-sdk-${{ matrix.arch }}-
 
-      - name: Check Existing Releases and Compile
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compile Packages
         run: |
+          # 动态查找当前仓库内的所有软件包目录
           cd ${{ github.workspace }}
+          # 找出包含 Makefile 的一级目录作为包名（排除 .github 等隐藏目录）
           PKGS=$(find . -mindepth 2 -maxdepth 2 -name Makefile | awk -F/ '{print $2}')
-          FORMAT=$(echo "${{ matrix.arch }}" | awk -F_ '{print $NF}')
-
-          # 尝试获取 latest 版本的 Release 中已有的文件，如果 Release 不存在则为空
-          LATEST_ASSETS=$(gh release view latest --json assets --jq '.assets[].name' 2>/dev/null || echo "")
+          echo "Found packages: $PKGS"
 
           cd sdk
+          # 生成默认配置
           make defconfig
 
+          # 遍历安装并编译每一个包
           for pkg in $PKGS; do
-            VERSION=$(grep '^PKG_VERSION:=' ../$pkg/Makefile | cut -d '=' -f 2 | tr -d ' \r\n')
-            RELEASE=$(grep '^PKG_RELEASE:=' ../$pkg/Makefile | cut -d '=' -f 2 | tr -d ' \r\n')
-
-            # 检查格式为 `包名_版本-发布号_架构.扩展名` 的文件是否已在 Release 中
-            if echo "$LATEST_ASSETS" | grep -q "^${pkg}_${VERSION}-${RELEASE}_.*\.${FORMAT}$"; then
-              echo "✅ [$pkg] v${VERSION}-${RELEASE} ($FORMAT) 已是最新，跳过编译。"
-            else
-              echo "🚀 [$pkg] 开始编译 v${VERSION}-${RELEASE} ($FORMAT)..."
-              ./scripts/feeds install $pkg
-              make package/$pkg/compile V=s -j$(nproc)
-            fi
+            echo "Installing and compiling $pkg..."
+            # 自动处理并安装依赖（如 rust）
+            ./scripts/feeds install $pkg
+            # 编译指定的包
+            make package/$pkg/compile V=s -j$(nproc)
           done
 
       - name: Collect IPK/APK files
-        id: collect
         run: |
           mkdir -p artifacts
           find sdk/bin/packages -type f \( -name "*.ipk" -o -name "*.apk" \) -exec cp {} artifacts/ \;
+          echo "Found files:"
+          ls -la artifacts/
 
-          if [ -d artifacts ] && [ "$(ls -A artifacts)" ]; then
-            echo "has_artifacts=true" >> $GITHUB_OUTPUT
-            ls -la artifacts/
-          else
-            echo "has_artifacts=false" >> $GITHUB_OUTPUT
-            echo "没有新的包产生。"
-          fi
-
-      - name: Delete Old Assets
-        if: steps.collect.outputs.has_artifacts == 'true'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate Release Tag
+        id: tag
         run: |
-          cd ${{ github.workspace }}
-          FORMAT=$(echo "${{ matrix.arch }}" | awk -F_ '{print $NF}')
+          # 使用当前时间戳作为统一的 Release Tag，适合多软件包仓库
+          TAG=$(date +"%Y%m%d-%H%M")
+          echo "release_tag=$TAG" >> $GITHUB_OUTPUT
 
-          for file in artifacts/*; do
-            filename=$(basename "$file")
-            pkgname=$(echo "$filename" | cut -d'_' -f1)
-
-            # 在最新 release 中找出该包的旧版本并删除（排除刚才编译好的最新文件名）
-            OLD_ASSETS=$(gh release view latest --json assets --jq '.assets[].name' 2>/dev/null | grep "^${pkgname}_" | grep "\.${FORMAT}$" || true)
-            for old in $OLD_ASSETS; do
-              if [ "$old" != "$filename" ]; then
-                echo "🗑️ 删除旧版本: $old"
-                gh release delete-asset latest "$old" -y || true
-              fi
-            done
-          done
-
-      - name: Create or Update Release
+      - name: Create Release and Upload
         uses: softprops/action-gh-release@v2
-        if: steps.collect.outputs.has_artifacts == 'true'
         with:
-          name: Latest Packages
-          tag_name: latest
+          tag_name: ${{ steps.tag.outputs.release_tag }}
           files: artifacts/*
           make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  cleanup:
+    name: Cleanup Old Releases
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Keep only latest release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 获取除了最新的 1 个之外的所有 release tags (tail -n +2 表示跳过第1行)
+          RELEASES_TO_DELETE=$(gh release list --limit 100 | awk '{print $1}' | tail -n +2)
+
+          if [ -z "$RELEASES_TO_DELETE" ]; then
+            echo "No old releases to delete."
+          else
+            for tag in $RELEASES_TO_DELETE; do
+              echo "Deleting release and tag: $tag"
+              gh release delete "$tag" --yes --cleanup-tag
+            done
+          fi
