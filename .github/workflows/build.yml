@@ -1,0 +1,117 @@
+name: Build OpenWrt Packages
+
+on:
+  push:
+    paths:
+      - "haut-auth/**"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 编译 23.05 稳定版以获取 .ipk 文件
+          - arch: x86_64_ipk
+            sdk_url: https://downloads.openwrt.org/releases/23.05.4/targets/x86/64/openwrt-sdk-23.05.4-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+          - arch: aarch64_ipk
+            sdk_url: https://downloads.openwrt.org/releases/23.05.4/targets/armsr/armv8/openwrt-sdk-23.05.4-armsr-armv8_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+          # 编译 Snapshot 快照版以获取 .apk 文件
+          - arch: x86_64_apk
+            sdk_url: https://downloads.openwrt.org/snapshots/targets/x86/64/openwrt-sdk-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.xz
+          - arch: aarch64_apk
+            sdk_url: https://downloads.openwrt.org/snapshots/targets/armsr/armv8/openwrt-sdk-armsr-armv8_gcc-13.3.0_musl.Linux-x86_64.tar.xz
+          # 你可以在这里添加更多你需要的架构
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3-distutils rsync unzip zlib1g-dev file wget
+
+      - name: Download and Extract SDK
+        run: |
+          wget -O sdk.tar.xz "${{ matrix.sdk_url }}"
+          mkdir sdk
+          tar -xf sdk.tar.xz -C sdk --strip-components=1
+          cd sdk
+          # 初始化 feeds
+          cp feeds.conf.default feeds.conf
+          echo "src-link customfeed ${{ github.workspace }}" >> feeds.conf
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Cache Toolchain and DL
+        uses: actions/cache@v4
+        with:
+          path: |
+            sdk/staging_dir/host*
+            sdk/dl
+          key: openwrt-sdk-${{ matrix.arch }}-${{ hashFiles('haut-auth/Makefile') }}
+          restore-keys: |
+            openwrt-sdk-${{ matrix.arch }}-
+
+      - name: Compile Package
+        run: |
+          cd sdk
+          # 生成默认配置
+          make defconfig
+          # 仅编译目标 package (这会触发依赖项 rust/host 的编译)
+          make package/haut-auth/compile V=s -j$(nproc)
+
+      - name: Collect IPK/APK files
+        run: |
+          mkdir -p artifacts
+          find sdk/bin/packages -type f \( -name "*.ipk" -o -name "*.apk" \) -exec cp {} artifacts/ \;
+          echo "Found files:"
+          ls -la artifacts/
+
+      - name: Generate Release Tag
+        id: tag
+        run: |
+          # 读取 Makefile 中的版本号
+          VERSION=$(grep '^PKG_VERSION:=' haut-auth/Makefile | cut -d '=' -f 2)
+          RELEASE=$(grep '^PKG_RELEASE:=' haut-auth/Makefile | cut -d '=' -f 2)
+          TAG="v${VERSION}-${RELEASE}"
+          echo "release_tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Create Release and Upload
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          files: artifacts/*
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  cleanup:
+    name: Cleanup Old Releases
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Keep only latest release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 获取除了最新的 1 个之外的所有 release tags (tail -n +2 表示跳过第1行)
+          RELEASES_TO_DELETE=$(gh release list --limit 100 | awk '{print $1}' | tail -n +2)
+
+          if [ -z "$RELEASES_TO_DELETE" ]; then
+            echo "No old releases to delete."
+          else
+            for tag in $RELEASES_TO_DELETE; do
+              echo "Deleting release and tag: $tag"
+              gh release delete "$tag" --yes --cleanup-tag
+            done
+          fi
