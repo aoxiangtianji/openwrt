@@ -30,6 +30,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
+
       - name: Install Dependencies
         run: |
           sudo apt-get update
@@ -73,10 +78,22 @@ jobs:
           # 生成默认配置
           make defconfig
 
+          # 绕过 OpenWrt 的 rust/host 漫长编译！直接使用 GitHub Runner 上预装的 Rust
+          echo "Bypassing OpenWrt rust/host build..."
+          mkdir -p staging_dir/host/bin
+          ln -s $(which cargo) staging_dir/host/bin/cargo
+          ln -s $(which rustc) staging_dir/host/bin/rustc
+
+          # 防止 package depend 上 rust
+          touch staging_dir/host/bin/rustdoc
+
           # 遍历安装并编译每一个包
           for pkg in $PKGS; do
             echo "Installing and compiling $pkg..."
-            # 自动处理并安装依赖（如 rust）
+            # 仅移除对 rust/host 的构建依赖，不影响普通 C/C++/Go 包，也不会破坏常规 DEPENDS
+            sed -i 's/rust\/host//g' ../$pkg/Makefile 2>/dev/null || true
+
+            # 自动处理并安装依赖
             ./scripts/feeds install $pkg
             # 编译指定的包
             make package/$pkg/compile V=s -j$(nproc)
