@@ -24,7 +24,6 @@ jobs:
             sdk_url: https://downloads.openwrt.org/snapshots/targets/x86/64/openwrt-sdk-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
           - arch: aarch64_apk
             sdk_url: https://downloads.openwrt.org/snapshots/targets/armsr/armv8/openwrt-sdk-armsr-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst
-          # 你可以在这里添加更多你需要的架构
 
     steps:
       - name: Checkout repository
@@ -50,7 +49,6 @@ jobs:
           mkdir sdk
           tar -xf "$FILENAME" -C sdk --strip-components=1
           cd sdk
-          # 初始化 feeds
           cp feeds.conf.default feeds.conf
           echo "src-link customfeed ${{ github.workspace }}" >> feeds.conf
           ./scripts/feeds update -a
@@ -66,82 +64,87 @@ jobs:
           restore-keys: |
             openwrt-sdk-${{ matrix.arch }}-
 
-      - name: Compile Packages
+      - name: Check Existing Releases and Compile
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 动态查找当前仓库内的所有软件包目录
           cd ${{ github.workspace }}
-          # 找出包含 Makefile 的一级目录作为包名（排除 .github 等隐藏目录）
-          PKGS=$(find . -mindepth 2 -maxdepth 2 -name Makefile | awk -F/ '{print $2}')
-          echo "Found packages: $PKGS"
+          # 找出所有包含 Makefile 的包目录（排除下载的 sdk 和生成的 artifacts 目录）
+          PKGS=$(find . -mindepth 2 -maxdepth 2 -name Makefile | awk -F/ '{print $2}' | grep -vE '^(sdk|artifacts)$')
+          FORMAT=$(echo "${{ matrix.arch }}" | awk -F_ '{print $NF}')
+
+          # 获取 latest 版本的 Release 中已有的文件
+          LATEST_ASSETS=$(gh release view latest --json assets --jq '.assets[].name' 2>/dev/null || echo "")
 
           cd sdk
-          # 生成默认配置
           make defconfig
 
-          # 绕过 OpenWrt 的 rust/host 漫长编译！直接使用 GitHub Runner 上预装的 Rust
+          # 绕过 OpenWrt 的 rust/host 漫长编译
           echo "Bypassing OpenWrt rust/host build..."
           mkdir -p staging_dir/host/bin
           ln -s $(which cargo) staging_dir/host/bin/cargo
           ln -s $(which rustc) staging_dir/host/bin/rustc
-
-          # 防止 package depend 上 rust
           touch staging_dir/host/bin/rustdoc
 
-          # 遍历安装并编译每一个包
           for pkg in $PKGS; do
-            echo "Installing and compiling $pkg..."
-            # 仅移除对 rust/host 的构建依赖，不影响普通 C/C++/Go 包，也不会破坏常规 DEPENDS
-            sed -i 's/rust\/host//g' ../$pkg/Makefile 2>/dev/null || true
+            VERSION=$(grep '^PKG_VERSION:=' ../$pkg/Makefile | cut -d '=' -f 2 | tr -d ' \r\n')
+            RELEASE=$(grep '^PKG_RELEASE:=' ../$pkg/Makefile | cut -d '=' -f 2 | tr -d ' \r\n')
 
-            # 自动处理并安装依赖
-            ./scripts/feeds install $pkg
-            # 编译指定的包
-            make package/$pkg/compile V=s -j$(nproc)
+            # 检查同架构版本的包是否已存在
+            if echo "$LATEST_ASSETS" | grep -q "^${pkg}_${VERSION}-${RELEASE}_.*\.${FORMAT}$"; then
+              echo "✅ [$pkg] v${VERSION}-${RELEASE} ($FORMAT) 已是最新，跳过编译。"
+            else
+              echo "🚀 [$pkg] 开始编译 v${VERSION}-${RELEASE} ($FORMAT)..."
+              # 仅移除对 rust/host 的依赖，不影响 C/Go 也不破坏常规 DEPENDS
+              sed -i 's/rust\/host//g' ../$pkg/Makefile 2>/dev/null || true
+
+              ./scripts/feeds install $pkg
+              make package/$pkg/compile V=s -j$(nproc)
+            fi
           done
 
       - name: Collect IPK/APK files
+        id: collect
         run: |
           mkdir -p artifacts
           find sdk/bin/packages -type f \( -name "*.ipk" -o -name "*.apk" \) -exec cp {} artifacts/ \;
-          echo "Found files:"
-          ls -la artifacts/
 
-      - name: Generate Release Tag
-        id: tag
+          if [ -d artifacts ] && [ "$(ls -A artifacts)" ]; then
+            echo "has_artifacts=true" >> $GITHUB_OUTPUT
+            ls -la artifacts/
+          else
+            echo "has_artifacts=false" >> $GITHUB_OUTPUT
+            echo "没有新的包产生。"
+          fi
+
+      - name: Delete Old Assets
+        if: steps.collect.outputs.has_artifacts == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 使用当前时间戳作为统一的 Release Tag，适合多软件包仓库
-          TAG=$(date +"%Y%m%d-%H%M")
-          echo "release_tag=$TAG" >> $GITHUB_OUTPUT
+          cd ${{ github.workspace }}
+          FORMAT=$(echo "${{ matrix.arch }}" | awk -F_ '{print $NF}')
 
-      - name: Create Release and Upload
+          for file in artifacts/*; do
+            filename=$(basename "$file")
+            pkgname=$(echo "$filename" | cut -d'_' -f1)
+
+            OLD_ASSETS=$(gh release view latest --json assets --jq '.assets[].name' 2>/dev/null | grep "^${pkgname}_" | grep "\.${FORMAT}$" || true)
+            for old in $OLD_ASSETS; do
+              if [ "$old" != "$filename" ]; then
+                echo "🗑️ 删除旧版本: $old"
+                gh release delete-asset latest "$old" -y || true
+              fi
+            done
+          done
+
+      - name: Create or Update Release
         uses: softprops/action-gh-release@v2
+        if: steps.collect.outputs.has_artifacts == 'true'
         with:
-          tag_name: ${{ steps.tag.outputs.release_tag }}
+          name: Latest Packages
+          tag_name: latest
           files: artifacts/*
           make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  cleanup:
-    name: Cleanup Old Releases
-    needs: build
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Keep only latest release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # 获取除了最新的 1 个之外的所有 release tags (tail -n +2 表示跳过第1行)
-          RELEASES_TO_DELETE=$(gh release list --limit 100 | awk '{print $1}' | tail -n +2)
-
-          if [ -z "$RELEASES_TO_DELETE" ]; then
-            echo "No old releases to delete."
-          else
-            for tag in $RELEASES_TO_DELETE; do
-              echo "Deleting release and tag: $tag"
-              gh release delete "$tag" --yes --cleanup-tag
-            done
-          fi
