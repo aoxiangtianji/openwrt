@@ -107,10 +107,16 @@ jobs:
         run: |
           mkdir -p artifacts sdk/bin/packages
 
+          cd ${{ github.workspace }}
+          PKGS=$(find . -mindepth 2 -maxdepth 2 -name Makefile | awk -F/ '{print $2}' | grep -vE '^(sdk|artifacts)$')
+
           # 收集并重命名以防止 apk 文件在 release 中互相覆盖
-          find sdk/bin/packages -type f \( -name "*.ipk" -o -name "*.apk" \) | while read file; do
-            filename=$(basename "$file")
-            cp "$file" "artifacts/${{ matrix.arch }}~${filename}"
+          # 遍历只属于我们自己的包，忽略 SDK 顺手编译出来的公共依赖包 (如 ca-bundle)
+          for pkg in $PKGS; do
+            find sdk/bin/packages -type f \( -name "${pkg}_*.ipk" -o -name "${pkg}-*.apk" \) | while read file; do
+              filename=$(basename "$file")
+              cp "$file" "artifacts/${{ matrix.arch }}~${filename}"
+            done
           done
 
           if [ -d artifacts ] && [ "$(ls -A artifacts)" ]; then
